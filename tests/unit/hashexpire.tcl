@@ -825,6 +825,15 @@ start_server {tags {"hashexpire"}} {
         assert {$ttl >= 2}
     }
 
+    # HEXPIRE on a non-existent field
+    test {HEXPIRE on a non-existent field (should not create field)} {
+        r FLUSHALL
+        r HSET myhash f1 v1
+        r HEXPIRE myhash 1000 FIELDS 1 f2
+        assert_equal 0 [r HEXISTS myhash f2]
+        assert_equal -2 [r HTTL myhash FIELDS 1 f2]
+    }
+
     # Error Cases
     test {HEXPIRE - conflicting conditions error} {
         r FLUSHALL
@@ -1282,6 +1291,15 @@ start_server {tags {"hashexpire"}} {
         # f4 does not exist
         assert_equal {1 -1 -2} [r hpersist myhash FIELDS 3 f1 f2 f4]
     }
+    
+    test {HPERSIST, then HEXPIRE, check new TTL is set} {
+        r FLUSHALL
+        r HSET myhash f1 v1
+        r HEXPIRE myhash 1000 FIELDS 1 f1
+        assert_equal 1 [r HPERSIST myhash FIELDS 1 f1]
+        r HEXPIRE myhash 2000 FIELDS 1 f1
+        assert_morethan [r HTTL myhash FIELDS 1 f1] 1000
+    }
 
      #################### HRANDFIELD ##################
 
@@ -1626,6 +1644,17 @@ start_server {tags {"hashexpire"}} {
         assert_equal $before $after
         r debug SET-ACTIVE-EXPIRE yes
     } {OK} {needs:debug}
+
+    test {HDEL on field with TTL, then re-add and check TTL is gone} {
+        r FLUSHALL
+        r HSET myhash f1 v1
+        r HEXPIRE myhash 10000 FIELDS 1 f1
+        assert_morethan [r HTTL myhash FIELDS 1 f1] 0
+        r HDEL myhash f1
+        r HSET myhash f1 v2
+        assert_equal -1 [r HTTL myhash FIELDS 1 f1]
+    }
+
 }
 
 ####### Test info
@@ -1992,7 +2021,7 @@ start_server {tags {"hashexpire external:skip"}} {
             }
         }
 
-        test {Replica Failover/Promotion to Primary} {
+        test {Replica Failover} {
             $primary FLUSHALL
             ####### Replication setup #######
             $replica_1 replicaof $primary_host $primary_port
@@ -2073,6 +2102,95 @@ start_server {tags {"hashexpire external:skip"}} {
             $rd_replica close
         }
         
+
+        test {Promotion to primary} {
+            $primary FLUSHALL
+            $primary DEBUG SET-ACTIVE-EXPIRE no
+            $replica_1 DEBUG SET-ACTIVE-EXPIRE no
+            ####### Replication setup #######
+            $replica_1 replicaof $primary_host $primary_port
+            wait_for_condition 50 100 {
+                [lindex [$replica_1 role] 0] eq {slave} &&
+                [string match {*master_link_status:up*} [$replica_1 info replication]]
+            } else {
+                fail "Can't turn the instance into a replica"
+            }
+            
+            # Create hash fields with TTL on primary
+            set f1_exp [expr {[clock seconds] + 200}]
+            set f2_exp [expr {[clock seconds] + 300000}]
+            $primary HSET myhash f1 v1 f2 v2 f3 v3
+            $primary HEXPIREAT myhash $f1_exp FIELDS 1 f1
+            $primary HEXPIREAT myhash $f2_exp FIELDS 1 f2
+            # f3 remains persistent
+
+            # Wait for full sync
+            wait_for_ofs_sync $primary $replica_1
+
+            # Verify primary and replica are the same
+            foreach instance [list $primary $replica_1] {
+                assert_equal $f1_exp [$instance HEXPIRETIME myhash FIELDS 1 f1]
+                assert_equal $f2_exp [$instance HEXPIRETIME myhash FIELDS 1 f2]
+                assert_equal -1 [$instance HTTL myhash FIELDS 1 f3]
+                assert_match  {1} [scan [regexp -inline {keys\=([\d]*)} [$instance info keyspace]] keys=%d]
+                assert_equal "v1 v2 v3" [$instance HMGET myhash f1 f2 f3]
+                assert_equal 3 [$instance HLEN myhash]
+            }
+
+            # Perform promotion to primary
+            $primary FAILOVER TO $replica_1_host $replica_1_port
+            # Wait for replica to become primary
+            wait_for_condition 100 100 {
+                [info_field [$replica_1 info replication] role] eq "master"
+            } else {
+                fail "Replica didn't become master"
+            }
+
+            # Setup keyspace notifications for the promoted replica
+            $replica_1 config set notify-keyspace-events KEA
+            set rd_replica [valkey_deferring_client $replica_1_host $replica_1_port]
+            assert_equal {1} [psubscribe $rd_replica __keyevent@*]
+
+            # Check all values that checked before are the same
+            assert_equal 3 [$replica_1 HLEN myhash]
+            assert_equal $f1_exp [$replica_1 HEXPIRETIME myhash FIELDS 1 f1]
+            assert_equal $f2_exp [$replica_1 HEXPIRETIME myhash FIELDS 1 f2]
+            assert_equal -1 [$replica_1 HTTL myhash FIELDS 1 f3]
+            assert_equal "v1 v2 v3" [$replica_1 HGETEX myhash FIELDS 3 f1 f2 f3]
+            assert_equal 3 [$replica_1 HLEN myhash]
+            
+            # Set f1 to expire in 1 second and wait for expiration
+            $replica_1 HEXPIRE myhash 1 FIELDS 1 f1 ;# will trigger hexpire
+            wait_for_ofs_sync $replica_1 $primary
+            wait_for_condition 50 100 {
+                [$replica_1 HTTL myhash FIELDS 1 f1] eq -2
+            } else {
+                fail "f1 not expired"
+            }
+
+            # Verify expiry
+            assert_equal "" [$replica_1 HGET myhash f1]
+            assert_equal 3 [$replica_1 HLEN myhash]
+            # Verify prev primary, which is now replica of new primary (prev primary) is sync
+            assert_equal 3 [$primary HLEN myhash]
+            # Change TTL of f2
+            $replica_1 HEXPIRE myhash 1000000 FIELDS 1 f2 ;# will trigger hexpire
+            assert_morethan [$replica_1 HTTL myhash FIELDS 1 f2] 9000
+            # Change TTL of f2 to 0 (immediate expiry)
+            $replica_1 HGETEX myhash EX 0 FIELDS 1 f2 ;# will trigger hexpired
+            # Verify final state
+            assert_equal 2 [$replica_1 HLEN myhash]
+            assert_equal "{} {} v3" [$replica_1 HGETEX myhash FIELDS 3 f1 f2 f3]
+
+            assert_keyevent_pattern $rd_replica hexpire myhash
+            assert_keyevent_pattern $rd_replica hexpire myhash
+            assert_keyevent_pattern $rd_replica hexpired myhash
+
+            $rd_replica close
+            # Re-enable active expiry
+            $primary DEBUG SET-ACTIVE-EXPIRE yes
+            $replica_1 DEBUG SET-ACTIVE-EXPIRE yes
+        } {OK} {needs:debug}
     }
 }
 
