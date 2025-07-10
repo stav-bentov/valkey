@@ -2088,17 +2088,24 @@ start_server {tags {"hashexpire external:skip"}} {
                 fail "f1 not expired"
             }
 
-            # Verify expiry
+            # Verify expiry in replica
             assert_equal "" [$replica_1 HGET myhash f1]
             assert_equal 3 [$replica_1 HLEN myhash]
+
+            # Verify no expiry in primary
+            assert_equal "v1" [$primary HGET myhash f1]
+
             # Change TTL of f2
             $replica_1 HEXPIRE myhash 1000000 FIELDS 1 f2 ;# will trigger hexpire
             assert_morethan [$replica_1 HTTL myhash FIELDS 1 f2] 9000
+            assert_equal $f2_exp [$primary HEXPIRETIME myhash FIELDS 1 f2]
+            
             # Change TTL of f2 to 0 (immediate expiry)
             $replica_1 HGETEX myhash EX 0 FIELDS 1 f2 ;# will trigger hexpired
             # Verify final state
             assert_equal 2 [$replica_1 HLEN myhash]
             assert_equal "{} {} v3" [$replica_1 HGETEX myhash FIELDS 3 f1 f2 f3]
+            assert_equal "v1 v2 v3" [$primary HGETEX myhash FIELDS 3 f1 f2 f3] ;# No change for primary
 
             assert_keyevent_pattern $rd_replica hexpire myhash
             assert_keyevent_pattern $rd_replica hexpire myhash
@@ -2140,8 +2147,10 @@ start_server {tags {"hashexpire external:skip"}} {
                 assert_equal $f1_exp [$instance HEXPIRETIME myhash FIELDS 1 f1]
                 assert_equal $f2_exp [$instance HEXPIRETIME myhash FIELDS 1 f2]
                 assert_equal -1 [$instance HTTL myhash FIELDS 1 f3]
-                assert_match  {1} [scan [regexp -inline {keys\=([\d]*)} [$instance info keyspace]] keys=%d]
-                assert_equal "v1 v2 v3" [$instance HMGET myhash f1 f2 f3]
+                assert_match {1} [scan [regexp -inline {keys\=([\d]*)} [$instance info keyspace]] keys=%d]
+                assert_equal "v1" [$instance HGET myhash f1]
+                assert_equal "v2" [$instance HGET myhash f2]
+                assert_equal "v3" [$instance HGET myhash f3]
                 assert_equal 3 [$instance HLEN myhash]
             }
 
@@ -2154,18 +2163,23 @@ start_server {tags {"hashexpire external:skip"}} {
                 fail "Replica didn't become master"
             }
 
-            # Setup keyspace notifications for the promoted replica
+            # Setup keyspace notifications
+            $primary config set notify-keyspace-events KEA
             $replica_1 config set notify-keyspace-events KEA
-            set rd_replica [valkey_deferring_client $replica_1_host $replica_1_port]
-            assert_equal {1} [psubscribe $rd_replica __keyevent@*]
+            set rd_primary [valkey_deferring_client -1]
+            set rd_replica_1 [valkey_deferring_client $replica_1_host $replica_1_port]
+            assert_equal {1} [psubscribe $rd_primary __keyevent@*]
+            assert_equal {1} [psubscribe $rd_replica_1 __keyevent@*]
 
-            # Check all values that checked before are the same
-            assert_equal 3 [$replica_1 HLEN myhash]
-            assert_equal $f1_exp [$replica_1 HEXPIRETIME myhash FIELDS 1 f1]
-            assert_equal $f2_exp [$replica_1 HEXPIRETIME myhash FIELDS 1 f2]
-            assert_equal -1 [$replica_1 HTTL myhash FIELDS 1 f3]
-            assert_equal "v1 v2 v3" [$replica_1 HGETEX myhash FIELDS 3 f1 f2 f3]
-            assert_equal 3 [$replica_1 HLEN myhash]
+            # Check all values that checked before are the same after the failover
+            foreach instance [list $primary $replica_1] {
+                assert_equal $f1_exp [$instance HEXPIRETIME myhash FIELDS 1 f1]
+                assert_equal $f2_exp [$instance HEXPIRETIME myhash FIELDS 1 f2]
+                assert_equal -1 [$instance HTTL myhash FIELDS 1 f3]
+                assert_match {1} [scan [regexp -inline {keys\=([\d]*)} [$instance info keyspace]] keys=%d]
+                assert_equal "v1 v2 v3" [$instance HMGET myhash f1 f2 f3]
+                assert_equal 3 [$instance HLEN myhash]
+            }
             
             # Set f1 to expire in 1 second and wait for expiration
             $replica_1 HEXPIRE myhash 1 FIELDS 1 f1 ;# will trigger hexpire
@@ -2176,25 +2190,43 @@ start_server {tags {"hashexpire external:skip"}} {
                 fail "f1 not expired"
             }
 
-            # Verify expiry
-            assert_equal "" [$replica_1 HGET myhash f1]
-            assert_equal 3 [$replica_1 HLEN myhash]
-            # Verify prev primary, which is now replica of new primary (prev primary) is sync
-            assert_equal 3 [$primary HLEN myhash]
+            # Verify replica and primary are sync
+            foreach instance [list $primary $replica_1] {
+                assert_equal $f2_exp [$instance HEXPIRETIME myhash FIELDS 1 f2]
+                assert_equal -2 [$instance HTTL myhash FIELDS 1 f1]
+                assert_match {1} [scan [regexp -inline {keys\=([\d]*)} [$instance info keyspace]] keys=%d]
+                assert_equal "" [$instance HGET myhash f1]
+                assert_equal "v2" [$instance HGET myhash f2]
+                assert_equal "v3" [$instance HGET myhash f3]
+                assert_equal 3 [$instance HLEN myhash]
+            }
+
             # Change TTL of f2
             $replica_1 HEXPIRE myhash 1000000 FIELDS 1 f2 ;# will trigger hexpire
-            assert_morethan [$replica_1 HTTL myhash FIELDS 1 f2] 9000
+            wait_for_ofs_sync $replica_1 $primary
+            foreach instance [list $primary $replica_1] {
+                assert_morethan [$instance HTTL myhash FIELDS 1 f2] 9000
+            }
+            
             # Change TTL of f2 to 0 (immediate expiry)
-            $replica_1 HGETEX myhash EX 0 FIELDS 1 f2 ;# will trigger hexpired
+            $replica_1 HGETEX myhash EX 0 FIELDS 1 f2 ;# will trigger hexpired for replica_1 and hdel for primary
             # Verify final state
-            assert_equal 2 [$replica_1 HLEN myhash]
-            assert_equal "{} {} v3" [$replica_1 HGETEX myhash FIELDS 3 f1 f2 f3]
+            foreach instance [list $primary $replica_1] {
+                assert_equal 2 [$instance HLEN myhash]
+                assert_equal "" [$instance HGET myhash f1]
+                assert_equal "" [$instance HGET myhash f2]
+                assert_equal "v3" [$instance HGET myhash f3]
+            }
 
-            assert_keyevent_pattern $rd_replica hexpire myhash
-            assert_keyevent_pattern $rd_replica hexpire myhash
-            assert_keyevent_pattern $rd_replica hexpired myhash
+            foreach rd [list $rd_replica_1 $rd_primary] {
+                assert_keyevent_pattern $rd hexpire myhash
+                assert_keyevent_pattern $rd hexpire myhash
+            }
+            assert_keyevent_pattern $rd_replica_1 hexpired myhash
+            assert_keyevent_pattern $rd_primary hdel myhash
 
-            $rd_replica close
+            $rd_replica_1 close
+            $rd_primary close
             # Re-enable active expiry
             $primary DEBUG SET-ACTIVE-EXPIRE yes
             $replica_1 DEBUG SET-ACTIVE-EXPIRE yes
